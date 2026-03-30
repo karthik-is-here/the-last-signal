@@ -1,0 +1,1153 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>The Last Signal</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link href="https://fonts.googleapis.com/css2?family=Orbitron:wght@400;700;900&family=Share+Tech+Mono&display=swap" rel="stylesheet" />
+  <style>
+    /* ─── RESET & BASE ─────────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    body {
+      background: #000;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      height: 100vh;
+      overflow: hidden;
+      font-family: 'Orbitron', monospace;
+    }
+
+    /* ─── CANVAS ────────────────────────────────────────────────────────── */
+    #gameCanvas {
+      display: block;
+      /* Soft outer glow — makes it feel submerged */
+      box-shadow:
+        0 0 60px rgba(0, 180, 200, 0.12),
+        0 0 120px rgba(0, 80, 120, 0.18),
+        inset 0 0 40px rgba(0,0,0,0.8);
+    }
+
+    /* ─── HUD OVERLAY (sits on top of canvas via absolute positioning) ─── */
+    #hud {
+      position: absolute;
+      top: 0; left: 0;
+      width: 100%;
+      height: 100%;
+      pointer-events: none;       /* clicks pass through to canvas */
+      display: flex;
+      flex-direction: column;
+      padding: 18px 24px;
+      gap: 10px;
+    }
+
+    /* Top row: oxygen bar + depth meter */
+    #hud-top {
+      display: flex;
+      align-items: flex-start;
+      justify-content: space-between;
+      width: 100%;
+    }
+
+    /* ── Oxygen bar ── */
+    #oxy-wrap {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+    #oxy-label {
+      font-size: 9px;
+      letter-spacing: 3px;
+      color: rgba(0, 230, 200, 0.6);
+      text-transform: uppercase;
+    }
+    #oxy-bar-bg {
+      width: 220px;
+      height: 10px;
+      background: rgba(0, 40, 60, 0.8);
+      border: 1px solid rgba(0, 200, 180, 0.25);
+      border-radius: 2px;
+      overflow: hidden;
+      position: relative;
+    }
+    #oxy-bar-fill {
+      height: 100%;
+      width: 100%;           /* JS will update this */
+      background: linear-gradient(90deg, #00c8a0, #00ecd4);
+      border-radius: 2px;
+      transition: background 0.5s;
+      box-shadow: 0 0 8px rgba(0, 230, 200, 0.6);
+    }
+
+    /* ── Depth meter ── */
+    #depth-wrap {
+      display: flex;
+      flex-direction: column;
+      align-items: flex-end;
+      gap: 5px;
+    }
+    #depth-label {
+      font-size: 9px;
+      letter-spacing: 3px;
+      color: rgba(0, 180, 230, 0.6);
+      text-transform: uppercase;
+    }
+    #depth-value {
+      font-family: 'Share Tech Mono', monospace;
+      font-size: 22px;
+      color: rgba(0, 210, 255, 0.85);
+      text-shadow: 0 0 12px rgba(0, 200, 255, 0.5);
+      letter-spacing: 2px;
+    }
+
+    /* ── Sonar cooldown (bottom-left) ── */
+    #sonar-wrap {
+      position: absolute;
+      bottom: 22px;
+      left: 24px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 6px;
+    }
+    #sonar-ring {
+      width: 44px;
+      height: 44px;
+      border-radius: 50%;
+      border: 2px solid rgba(0, 230, 150, 0.3);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      position: relative;
+    }
+    #sonar-ring::after {
+      content: '';
+      width: 28px;
+      height: 28px;
+      border-radius: 50%;
+      border: 1px solid rgba(0, 230, 150, 0.15);
+    }
+    #sonar-key {
+      font-size: 8px;
+      letter-spacing: 2px;
+      color: rgba(0, 200, 130, 0.5);
+      text-transform: uppercase;
+    }
+
+    /* ── Small status line ── */
+    #status-line {
+      position: absolute;
+      bottom: 22px;
+      left: 50%;
+      transform: translateX(-50%);
+      font-family: 'Share Tech Mono', monospace;
+      font-size: 11px;
+      letter-spacing: 2px;
+      color: rgba(0, 180, 200, 0.4);
+      text-transform: uppercase;
+    }
+  </style>
+</head>
+<body>
+
+<!-- ─── CANVAS ─────────────────────────────────────────────────────────────── -->
+<canvas id="gameCanvas"></canvas>
+
+<!-- ─── HUD (HTML overlay, not drawn on canvas) ──────────────────────────── -->
+<div id="hud">
+  <div id="hud-top">
+    <div id="oxy-wrap">
+      <div id="oxy-label">O₂ Supply</div>
+      <div id="oxy-bar-bg">
+        <div id="oxy-bar-fill"></div>
+      </div>
+    </div>
+    <div id="depth-wrap">
+      <div id="depth-label">Depth</div>
+      <div id="depth-value">0m</div>
+    </div>
+  </div>
+  <div id="sonar-wrap">
+    <div id="sonar-ring"></div>
+    <div id="sonar-key">SPACE · SONAR</div>
+  </div>
+  <div id="status-line" id="status-line">Navigating · Signal Detected</div>
+</div>
+
+<script>
+// ═══════════════════════════════════════════════════════════════════════════
+//  THE LAST SIGNAL — Step 2: Obstacles & World
+//  Sections:
+//    1. Canvas Setup
+//    2. Constants & Config
+//    3. Game State
+//    4. Particle System (background atmosphere)
+//    5. Player (submarine)
+//    6. Input Handling
+//    7. Draw Helpers
+//    8. Obstacle System          ← NEW
+//    9. Update Logic
+//   10. Render Logic
+//   11. Game Loop
+// ═══════════════════════════════════════════════════════════════════════════
+
+
+// ─── 1. CANVAS SETUP ────────────────────────────────────────────────────────
+const canvas  = document.getElementById('gameCanvas');
+const ctx     = canvas.getContext('2d');
+
+// We use a fixed logical resolution and CSS-scale it.
+// This keeps all coordinate math predictable regardless of screen size.
+const LOGICAL_W = 960;
+const LOGICAL_H = 540;
+
+canvas.width  = LOGICAL_W;
+canvas.height = LOGICAL_H;
+
+// Scale to fit the viewport while preserving aspect ratio
+function resizeCanvas() {
+  const scaleX = window.innerWidth  / LOGICAL_W;
+  const scaleY = window.innerHeight / LOGICAL_H;
+  const scale  = Math.min(scaleX, scaleY);
+  canvas.style.width  = (LOGICAL_W * scale) + 'px';
+  canvas.style.height = (LOGICAL_H * scale) + 'px';
+}
+resizeCanvas();
+window.addEventListener('resize', resizeCanvas);
+
+
+// ─── 2. CONSTANTS & CONFIG ──────────────────────────────────────────────────
+const CFG = {
+  // Player physics
+  PLAYER_ACCEL:    0.45,   // thrust per frame
+  PLAYER_DRAG:     0.88,   // velocity multiplier each frame (< 1 = drag)
+  PLAYER_MAX_SPD:  5.5,
+
+  // World
+  SCROLL_SPEED:    1.8,    // how fast the world scrolls left (world units/frame)
+  WORLD_LENGTH:    12000,  // total world width in px before win condition
+
+  // Oxygen (placeholder values — will be wired up in Step 4)
+  OXY_MAX:         100,
+  OXY_DRAIN_RATE:  0,      // set to 0 for now so it doesn't affect testing
+
+  // Parallax layer speeds (fraction of scroll speed)
+  PARALLAX: [0.15, 0.30, 0.55, 0.80],
+
+  // Visual
+  BOB_AMPLITUDE:   2.5,    // px of idle bobbing
+  BOB_SPEED:       0.04,   // radians per frame
+
+  // Obstacles
+  ROCK_SPACING:    310,    // world-units between rock cluster attempts
+  ROCK_GAP_MIN:    155,    // minimum vertical gap the player can pass through
+  DEBRIS_SPACING:  420,    // world-units between mid-water debris chunks
+  CORAL_SPACING:   500,    // world-units between coral clusters
+
+  // Debug — set true to see collision boxes
+  DEBUG:           false,
+};
+
+
+// ─── 3. GAME STATE ──────────────────────────────────────────────────────────
+// Central truth for every mutable piece of game data.
+// Keeping it in one object makes save/reset trivial later.
+const state = {
+  tick:        0,          // incremented every frame — drives animations
+  worldX:      0,          // how far the world has scrolled (px)
+  oxygen:      CFG.OXY_MAX,
+  running:     true,
+  colliding:   false,      // true when sub overlaps an obstacle this frame
+  player: {
+    x:   140,              // logical screen position (stays roughly centred-left)
+    y:   LOGICAL_H / 2,
+    vx:  0,
+    vy:  0,
+    bobOffset: 0,          // current sine value for idle bob
+  },
+};
+
+
+// ─── 4. PARTICLE SYSTEM ─────────────────────────────────────────────────────
+// Three layers of drifting particles create the illusion of depth.
+// Each layer scrolls at a different speed (parallax).
+// Particles represent: micro-sediment, drifting plankton, distant debris.
+
+const PARTICLE_LAYERS = [
+  // Layer 0 — farthest back: tiny dim specs, very slow
+  { count: 60,  minR: 0.5, maxR: 1.2, color: 'rgba(0,160,180,0.18)', speed: CFG.PARALLAX[0] },
+  // Layer 1 — mid-back: small glowing motes
+  { count: 40,  minR: 0.8, maxR: 1.8, color: 'rgba(0,200,160,0.22)', speed: CFG.PARALLAX[1] },
+  // Layer 2 — mid: slightly larger, greener (bioluminescent feel)
+  { count: 25,  minR: 1.0, maxR: 2.5, color: 'rgba(20,220,160,0.28)', speed: CFG.PARALLAX[2] },
+  // Layer 3 — near: largest, brightest — pass by quickly
+  { count: 15,  minR: 1.5, maxR: 3.5, color: 'rgba(60,230,180,0.35)', speed: CFG.PARALLAX[3] },
+];
+
+// Initialise particles; each has its own random position, drift velocity,
+// and a layer index so we know which parallax speed to apply.
+const particles = [];
+
+PARTICLE_LAYERS.forEach((layer, li) => {
+  for (let i = 0; i < layer.count; i++) {
+    particles.push(spawnParticle(layer, li, true));
+  }
+});
+
+function spawnParticle(layer, layerIndex, randomX = false) {
+  return {
+    x:     randomX ? Math.random() * LOGICAL_W : LOGICAL_W + Math.random() * 60,
+    y:     Math.random() * LOGICAL_H,
+    r:     layer.minR + Math.random() * (layer.maxR - layer.minR),
+    vy:    (Math.random() - 0.5) * 0.18,   // gentle vertical drift
+    alpha: 0.4 + Math.random() * 0.6,       // twinkle base
+    twinkleSpeed: 0.01 + Math.random() * 0.03,
+    twinklePhase: Math.random() * Math.PI * 2,
+    layer: layerIndex,
+    layerRef: layer,
+  };
+}
+
+function updateParticles() {
+  particles.forEach(p => {
+    const layer = p.layerRef;
+    // Scroll left at the layer's parallax speed
+    p.x -= CFG.SCROLL_SPEED * layer.speed;
+    p.y += p.vy;
+    // Twinkle
+    p.twinklePhase += p.twinkleSpeed;
+
+    // Wrap around when they exit left edge
+    if (p.x < -10) {
+      Object.assign(p, spawnParticle(layer, p.layer, false));
+    }
+    // Wrap vertical
+    if (p.y < -10)  p.y = LOGICAL_H + 5;
+    if (p.y > LOGICAL_H + 10) p.y = -5;
+  });
+}
+
+function drawParticles() {
+  particles.forEach(p => {
+    const twinkle = 0.5 + 0.5 * Math.sin(p.twinklePhase);
+    const a = p.alpha * (0.6 + 0.4 * twinkle);
+    ctx.save();
+    ctx.globalAlpha = a;
+    ctx.fillStyle   = p.layerRef.color;
+    ctx.beginPath();
+    ctx.arc(p.x, p.y, p.r, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  });
+}
+
+
+// ─── 5. PLAYER (SUBMARINE) ──────────────────────────────────────────────────
+// The sub is drawn entirely with canvas 2D shapes — no images needed.
+// It has three parts: hull, conning tower, propeller.
+// The whole thing is translated by the bob offset each frame.
+
+function updatePlayer() {
+  const p = state.player;
+
+  // Apply thrust from held keys
+  if (keys.up   || keys.w) p.vy -= CFG.PLAYER_ACCEL;
+  if (keys.down || keys.s) p.vy += CFG.PLAYER_ACCEL;
+  if (keys.left || keys.a) p.vx -= CFG.PLAYER_ACCEL;
+  if (keys.right|| keys.d) p.vx += CFG.PLAYER_ACCEL;
+
+  // Clamp speed
+  const spd = Math.hypot(p.vx, p.vy);
+  if (spd > CFG.PLAYER_MAX_SPD) {
+    p.vx = (p.vx / spd) * CFG.PLAYER_MAX_SPD;
+    p.vy = (p.vy / spd) * CFG.PLAYER_MAX_SPD;
+  }
+
+  // Drag — gradually kills velocity when no key held
+  p.vx *= CFG.PLAYER_DRAG;
+  p.vy *= CFG.PLAYER_DRAG;
+
+  // Integrate
+  p.x += p.vx;
+  p.y += p.vy;
+
+  // Idle bobbing (always active, independent of input)
+  p.bobOffset = Math.sin(state.tick * CFG.BOB_SPEED) * CFG.BOB_AMPLITUDE;
+
+  // Clamp to canvas bounds — leave a margin so the sub never clips
+  p.x = Math.max(40,  Math.min(LOGICAL_W - 80, p.x));
+  p.y = Math.max(30,  Math.min(LOGICAL_H - 30, p.y));
+}
+
+function drawSubmarine(x, y) {
+  // y already includes bob offset when called
+  ctx.save();
+  ctx.translate(x, y);
+
+  // ── Propeller (drawn first / behind hull) ──
+  const propTime = state.tick * 0.25;
+  ctx.save();
+  ctx.translate(-46, 0);
+  for (let b = 0; b < 3; b++) {
+    const angle = propTime + (b * Math.PI * 2 / 3);
+    ctx.save();
+    ctx.rotate(angle);
+    ctx.fillStyle = 'rgba(80, 160, 180, 0.85)';
+    ctx.beginPath();
+    ctx.ellipse(0, -7, 3, 7, 0, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+  }
+  // Prop hub
+  ctx.fillStyle = '#1a8fa0';
+  ctx.beginPath();
+  ctx.arc(0, 0, 3.5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.restore();
+
+  // ── Hull shadow (gives depth) ──
+  ctx.save();
+  ctx.shadowColor = 'rgba(0, 200, 220, 0.15)';
+  ctx.shadowBlur  = 18;
+
+  // Main hull — elongated ellipse
+  const hullGrad = ctx.createLinearGradient(-40, -14, -40, 14);
+  hullGrad.addColorStop(0,   '#1e6a7a');
+  hullGrad.addColorStop(0.4, '#0e4a5a');
+  hullGrad.addColorStop(1,   '#081e28');
+  ctx.fillStyle = hullGrad;
+  ctx.beginPath();
+  ctx.ellipse(0, 0, 44, 13, 0, 0, Math.PI * 2);
+  ctx.fill();
+
+  // Hull rim / highlight
+  ctx.strokeStyle = 'rgba(0, 200, 220, 0.45)';
+  ctx.lineWidth   = 1.2;
+  ctx.stroke();
+  ctx.restore();
+
+  // ── Conning tower ──
+  const towerGrad = ctx.createLinearGradient(8, -24, 22, -12);
+  towerGrad.addColorStop(0, '#1a7a8a');
+  towerGrad.addColorStop(1, '#0a3a48');
+  ctx.fillStyle = towerGrad;
+  ctx.beginPath();
+  ctx.roundRect(8, -24, 16, 14, [3, 3, 0, 0]);
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(0, 200, 220, 0.3)';
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  // Tower porthole
+  ctx.fillStyle = 'rgba(0, 230, 255, 0.25)';
+  ctx.beginPath();
+  ctx.arc(16, -18, 3.5, 0, Math.PI * 2);
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(0, 220, 255, 0.6)';
+  ctx.lineWidth = 0.8;
+  ctx.stroke();
+
+  // ── Nose light ──
+  const noseGlow = ctx.createRadialGradient(44, 0, 0, 44, 0, 16);
+  noseGlow.addColorStop(0,   'rgba(100, 240, 255, 0.9)');
+  noseGlow.addColorStop(0.4, 'rgba(0, 200, 240, 0.4)');
+  noseGlow.addColorStop(1,   'rgba(0, 150, 200, 0)');
+  ctx.fillStyle = noseGlow;
+  ctx.beginPath();
+  ctx.arc(44, 0, 16, 0, Math.PI * 2);
+  ctx.fill();
+
+  // ── Hull rivets / detail ──
+  ctx.fillStyle = 'rgba(0, 180, 200, 0.5)';
+  [-20, 0, 18].forEach(rx => {
+    ctx.beginPath();
+    ctx.arc(rx, -10, 1.5, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.beginPath();
+    ctx.arc(rx, 10, 1.5, 0, Math.PI * 2);
+    ctx.fill();
+  });
+
+  // ── Bubble trail (emits from rear) ──
+  // These are drawn as small translucent circles that rise
+  drawBubbleTrail();
+
+  ctx.restore();
+}
+
+// Small bubbles that drift up from behind the sub
+const bubbles = Array.from({ length: 14 }, () => newBubble(true));
+
+function newBubble(randomInit = false) {
+  return {
+    x:     -46 + (Math.random() - 0.5) * 8,
+    y:     (Math.random() - 0.5) * 8,
+    r:     0.8 + Math.random() * 2.2,
+    vy:   -(0.4 + Math.random() * 0.6),
+    vx:   -(0.3 + Math.random() * 0.5),
+    life:  randomInit ? Math.random() : 0,
+    maxLife: 0.6 + Math.random() * 0.8,
+  };
+}
+
+function drawBubbleTrail() {
+  bubbles.forEach(b => {
+    b.life += 0.016;
+    b.x    += b.vx;
+    b.y    += b.vy;
+    if (b.life >= b.maxLife) Object.assign(b, newBubble());
+
+    const t = b.life / b.maxLife;
+    ctx.globalAlpha = (1 - t) * 0.5;
+    ctx.strokeStyle = 'rgba(120, 230, 255, 0.8)';
+    ctx.lineWidth   = 0.8;
+    ctx.beginPath();
+    ctx.arc(b.x, b.y, b.r, 0, Math.PI * 2);
+    ctx.stroke();
+  });
+  ctx.globalAlpha = 1;
+}
+
+
+// ─── 6. INPUT HANDLING ──────────────────────────────────────────────────────
+// Simple key-state map. Holding a key is the primary control model.
+const keys = { up:false, down:false, left:false, right:false, w:false, a:false, s:false, d:false, space:false };
+
+window.addEventListener('keydown', e => {
+  switch (e.code) {
+    case 'ArrowUp':    keys.up    = true; break;
+    case 'ArrowDown':  keys.down  = true; break;
+    case 'ArrowLeft':  keys.left  = true; break;
+    case 'ArrowRight': keys.right = true; break;
+    case 'KeyW':       keys.w     = true; break;
+    case 'KeyA':       keys.a     = true; break;
+    case 'KeyS':       keys.s     = true; break;
+    case 'KeyD':       keys.d     = true; break;
+    case 'Space':      keys.space = true; e.preventDefault(); break;
+  }
+});
+
+window.addEventListener('keyup', e => {
+  switch (e.code) {
+    case 'ArrowUp':    keys.up    = false; break;
+    case 'ArrowDown':  keys.down  = false; break;
+    case 'ArrowLeft':  keys.left  = false; break;
+    case 'ArrowRight': keys.right = false; break;
+    case 'KeyW':       keys.w     = false; break;
+    case 'KeyA':       keys.a     = false; break;
+    case 'KeyS':       keys.s     = false; break;
+    case 'KeyD':       keys.d     = false; break;
+    case 'Space':      keys.space = false; break;
+  }
+});
+
+
+// ─── 7. DRAW HELPERS ────────────────────────────────────────────────────────
+
+// The background is a vertical gradient from very deep navy to near-black.
+// We also draw subtle horizontal "pressure layer" bands.
+function drawBackground() {
+  // Base ocean gradient
+  const bg = ctx.createLinearGradient(0, 0, 0, LOGICAL_H);
+  bg.addColorStop(0,    '#020d1a');
+  bg.addColorStop(0.35, '#021428');
+  bg.addColorStop(0.7,  '#010c1e');
+  bg.addColorStop(1,    '#000810');
+  ctx.fillStyle = bg;
+  ctx.fillRect(0, 0, LOGICAL_W, LOGICAL_H);
+
+  // Subtle horizontal depth bands (thermoclines)
+  for (let i = 0; i < 5; i++) {
+    const bandY = (LOGICAL_H / 5) * i + ((state.tick * 0.12) % (LOGICAL_H / 5));
+    const bandGrad = ctx.createLinearGradient(0, bandY, 0, bandY + 28);
+    bandGrad.addColorStop(0,   'rgba(0, 80, 120, 0)');
+    bandGrad.addColorStop(0.5, 'rgba(0, 80, 120, 0.04)');
+    bandGrad.addColorStop(1,   'rgba(0, 80, 120, 0)');
+    ctx.fillStyle = bandGrad;
+    ctx.fillRect(0, bandY, LOGICAL_W, 28);
+  }
+}
+
+// A gentle caustic-light shimmer on the surface (top ~80px)
+function drawSurfaceCaustics() {
+  const t = state.tick * 0.008;
+  for (let i = 0; i < 8; i++) {
+    const cx = ((i * 137 + t * 60) % LOGICAL_W);
+    const cy = 20 + Math.sin(t + i) * 18;
+    const r  = 30 + Math.sin(t * 1.3 + i * 0.8) * 15;
+    const caustic = ctx.createRadialGradient(cx, cy, 0, cx, cy, r);
+    caustic.addColorStop(0,   'rgba(0, 180, 220, 0.06)');
+    caustic.addColorStop(1,   'rgba(0, 180, 220, 0)');
+    ctx.fillStyle = caustic;
+    ctx.beginPath();
+    ctx.ellipse(cx, cy, r, r * 0.3, 0, 0, Math.PI * 2);
+    ctx.fill();
+  }
+}
+
+// Floor — drawn procedurally using the floor heightmap from the obstacle system
+// (Falls back to flat band before obstacleSystem is initialised)
+function drawFloor() {
+  if (typeof obstacleSystem !== 'undefined') {
+    obstacleSystem.drawFloor();
+  } else {
+    const floorY = LOGICAL_H - 55;
+    const floorGrad = ctx.createLinearGradient(0, floorY, 0, LOGICAL_H);
+    floorGrad.addColorStop(0, 'rgba(0, 20, 35, 0)');
+    floorGrad.addColorStop(0.3, '#020e1c');
+    floorGrad.addColorStop(1,   '#000508');
+    ctx.fillStyle = floorGrad;
+    ctx.fillRect(0, floorY, LOGICAL_W, LOGICAL_H - floorY);
+  }
+}
+
+// Scan-line overlay — mimics a pressure-cracked viewport feel
+function drawScanlines() {
+  ctx.save();
+  ctx.globalAlpha = 0.025;
+  ctx.fillStyle = '#000';
+  for (let y = 0; y < LOGICAL_H; y += 3) {
+    ctx.fillRect(0, y, LOGICAL_W, 1);
+  }
+  ctx.restore();
+}
+
+
+// ─── 8. OBSTACLE SYSTEM ─────────────────────────────────────────────────────
+// Design philosophy:
+//   • All obstacles are generated ahead of time as world-space objects.
+//   • Each object stores its world-X position. To draw it we compute:
+//       screenX = obj.worldX - state.worldX
+//   • Objects far off-screen (left or right) are skipped — cheap culling.
+//   • Three obstacle types:
+//       1. RockPair   — floor spike + optional ceiling spike forming a gate
+//       2. Debris     — mid-water drifting wreckage chunks
+//       3. Coral      — floor-anchored decorative clusters (also solid)
+//   • A seeded PRNG means the level is the same every run (fair deaths).
+//   • Collision uses AABB (axis-aligned bounding box) for rocks/debris
+//     and a circle check for coral.
+
+// ── Seeded PRNG (Mulberry32) ──────────────────────────────────────────────
+// Using a seeded generator so the obstacle layout is deterministic.
+function mulberry32(seed) {
+  return function() {
+    seed |= 0; seed = seed + 0x6D2B79F5 | 0;
+    let t = Math.imul(seed ^ seed >>> 15, 1 | seed);
+    t = t + Math.imul(t ^ t >>> 7, 61 | t) ^ t;
+    return ((t ^ t >>> 14) >>> 0) / 4294967296;
+  };
+}
+const rng = mulberry32(0xDEADBEEF);
+
+// ── Floor heightmap ───────────────────────────────────────────────────────
+// We pre-bake a smooth floor height curve across the whole world.
+// This drives both visuals AND rock placement.
+const FLOOR_SAMPLES = 420;                         // one sample every ~28.6 world-px
+const floorHeights  = new Float32Array(FLOOR_SAMPLES);
+
+(function generateFloor() {
+  // Layered sine waves give organic variation
+  for (let i = 0; i < FLOOR_SAMPLES; i++) {
+    const t = i / FLOOR_SAMPLES;
+    const h =
+      Math.sin(t * Math.PI * 6  + 0.3) * 22 +
+      Math.sin(t * Math.PI * 13 + 1.1) * 12 +
+      Math.sin(t * Math.PI * 28 + 2.4) * 6  +
+      rng() * 8;                                   // high-freq noise
+    floorHeights[i] = LOGICAL_H - 58 + h;         // base floor Y + variation
+  }
+})();
+
+function getFloorY(worldX) {
+  // Interpolate floor height at any world-x position
+  const t   = (worldX / CFG.WORLD_LENGTH) * (FLOOR_SAMPLES - 1);
+  const i0  = Math.floor(t) % FLOOR_SAMPLES;
+  const i1  = (i0 + 1) % FLOOR_SAMPLES;
+  const frac = t - Math.floor(t);
+  return floorHeights[i0] * (1 - frac) + floorHeights[i1] * frac;
+}
+
+// ── Obstacle generation ───────────────────────────────────────────────────
+const obstacles = [];   // all obstacle objects live here
+
+(function generateObstacles() {
+  // ── 1. Rock pairs ──
+  // Spaced every ROCK_SPACING world-units; skip the first 600px (player spawn buffer)
+  for (let wx = 800; wx < CFG.WORLD_LENGTH - 400; wx += CFG.ROCK_SPACING + (rng() - 0.5) * 120) {
+    const floorY   = getFloorY(wx);
+    const ceilY    = 0;                             // ceiling is top of screen
+    const gapH     = CFG.ROCK_GAP_MIN + rng() * 80; // passage height
+    const gapCentre = ceilY + (floorY - ceilY) * (0.25 + rng() * 0.5);
+
+    const topH    = gapCentre - gapH / 2;           // height of ceiling spike
+    const botY    = gapCentre + gapH / 2;           // top of floor spike
+    const botH    = floorY - botY;
+
+    const w = 38 + rng() * 24;                      // rock width varies
+
+    // Ceiling rock (only if there's enough height to be meaningful)
+    if (topH > 20) {
+      obstacles.push({
+        type: 'rock',
+        anchor: 'ceiling',
+        worldX: wx,
+        w, h: topH,
+        // AABB in local coords (relative to worldX, top-anchored)
+        bx: -w / 2, by: 0, bw: w, bh: topH,
+        // Visual shape: array of {x,y} points for a jagged polygon
+        points: makeRockPoints(w, topH, 'ceiling', rng),
+        shade: 0.5 + rng() * 0.5,
+      });
+    }
+
+    // Floor rock
+    if (botH > 12) {
+      obstacles.push({
+        type: 'rock',
+        anchor: 'floor',
+        worldX: wx,
+        w, h: botH,
+        bx: -w / 2, by: botY, bw: w, bh: botH,
+        points: makeRockPoints(w, botH, 'floor', rng),
+        baseY: botY,
+        shade: 0.5 + rng() * 0.5,
+      });
+    }
+  }
+
+  // ── 2. Debris chunks ──
+  for (let wx = 500; wx < CFG.WORLD_LENGTH - 200; wx += CFG.DEBRIS_SPACING + (rng() - 0.5) * 160) {
+    const floorY = getFloorY(wx);
+    const count  = 2 + Math.floor(rng() * 4);
+    for (let c = 0; c < count; c++) {
+      const dw   = 14 + rng() * 28;
+      const dh   = 8  + rng() * 18;
+      const dy   = 80 + rng() * (floorY - 140);
+      const dx   = (rng() - 0.5) * 60;
+      obstacles.push({
+        type:   'debris',
+        worldX: wx + dx,
+        w: dw, h: dh,
+        bx: -dw / 2, by: dy - dh / 2, bw: dw, bh: dh,
+        y:  dy,
+        rotation: rng() * Math.PI,
+        shade:    rng(),
+        variant:  Math.floor(rng() * 3),  // 0=pipe, 1=panel, 2=sphere
+      });
+    }
+  }
+
+  // ── 3. Coral clusters ──
+  for (let wx = 400; wx < CFG.WORLD_LENGTH - 300; wx += CFG.CORAL_SPACING + (rng() - 0.5) * 200) {
+    const floorY = getFloorY(wx);
+    const count  = 3 + Math.floor(rng() * 5);
+    for (let c = 0; c < count; c++) {
+      const cx    = (rng() - 0.5) * 80;
+      const ch    = 18 + rng() * 36;
+      const cw    = 5  + rng() * 8;
+      obstacles.push({
+        type:   'coral',
+        worldX: wx + cx,
+        baseY:  floorY,
+        h: ch, w: cw,
+        bx: -cw, by: floorY - ch, bw: cw * 2, bh: ch,
+        hue:    rng() > 0.5 ? 160 : 280,  // teal or purple coral
+        shade:  0.6 + rng() * 0.4,
+        sway:   (rng() - 0.5) * 0.04,     // sway speed
+        swayPhase: rng() * Math.PI * 2,
+      });
+    }
+  }
+})();
+
+// Helper: make a jagged rock polygon
+function makeRockPoints(w, h, anchor, rand) {
+  const pts   = [];
+  const segs  = 6 + Math.floor(rand() * 4);
+  // Base edge runs full width
+  if (anchor === 'ceiling') {
+    pts.push({ x: -w / 2, y: 0 });
+    for (let i = 0; i <= segs; i++) {
+      const fx = -w / 2 + (w / segs) * i;
+      const fy = h * (0.6 + rand() * 0.4);
+      pts.push({ x: fx, y: fy });
+    }
+    pts.push({ x: w / 2, y: 0 });
+  } else {
+    pts.push({ x: -w / 2, y: h });
+    for (let i = 0; i <= segs; i++) {
+      const fx = -w / 2 + (w / segs) * i;
+      const fy = -(h * (0.6 + rand() * 0.4));
+      pts.push({ x: fx, y: fy });
+    }
+    pts.push({ x: w / 2, y: h });
+  }
+  return pts;
+}
+
+// ── Obstacle draw functions ───────────────────────────────────────────────
+
+const obstacleSystem = {
+
+  // ── Draw the procedural floor ──
+  drawFloor() {
+    ctx.save();
+    ctx.beginPath();
+    ctx.moveTo(0, LOGICAL_H);
+    for (let sx = 0; sx <= LOGICAL_W; sx += 4) {
+      const wx  = state.worldX + sx;
+      const fy  = getFloorY(wx);
+      ctx.lineTo(sx, fy);
+    }
+    ctx.lineTo(LOGICAL_W, LOGICAL_H);
+    ctx.closePath();
+
+    const grad = ctx.createLinearGradient(0, LOGICAL_H - 80, 0, LOGICAL_H);
+    grad.addColorStop(0,   '#011520');
+    grad.addColorStop(0.4, '#010c18');
+    grad.addColorStop(1,   '#000508');
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    // Glowing floor edge
+    ctx.strokeStyle = 'rgba(0, 100, 140, 0.35)';
+    ctx.lineWidth   = 1.5;
+    ctx.beginPath();
+    for (let sx = 0; sx <= LOGICAL_W; sx += 4) {
+      const wx = state.worldX + sx;
+      const fy = getFloorY(wx);
+      sx === 0 ? ctx.moveTo(sx, fy) : ctx.lineTo(sx, fy);
+    }
+    ctx.stroke();
+    ctx.restore();
+  },
+
+  // ── Draw all visible obstacles ──
+  draw() {
+    const cullingMargin = 120;
+    obstacles.forEach(ob => {
+      const sx = ob.worldX - state.worldX;   // screen-space X
+      if (sx < -cullingMargin || sx > LOGICAL_W + cullingMargin) return;
+
+      ctx.save();
+      ctx.translate(sx, 0);
+
+      if      (ob.type === 'rock')   this.drawRock(ob);
+      else if (ob.type === 'debris') this.drawDebris(ob);
+      else if (ob.type === 'coral')  this.drawCoral(ob);
+
+      // Debug bounding boxes
+      if (CFG.DEBUG) {
+        ctx.strokeStyle = 'rgba(255,0,0,0.7)';
+        ctx.lineWidth = 1;
+        ctx.strokeRect(ob.bx, ob.by, ob.bw, ob.bh);
+      }
+
+      ctx.restore();
+    });
+  },
+
+  drawRock(ob) {
+    const pts = ob.points;
+    if (!pts || pts.length < 3) return;
+
+    const baseY = ob.anchor === 'floor' ? ob.baseY : 0;
+    ctx.save();
+    ctx.translate(0, baseY);
+
+    // Rock body
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+    ctx.closePath();
+
+    const isFloor = ob.anchor === 'floor';
+    const grad = ctx.createLinearGradient(0, isFloor ? 0 : ob.h, 0, isFloor ? -ob.h : 0);
+    const s = ob.shade;
+    grad.addColorStop(0,   `rgba(${8 + s*20},${22 + s*18},${30 + s*22}, 1)`);
+    grad.addColorStop(0.5, `rgba(${4 + s*12},${14 + s*10},${20 + s*14}, 1)`);
+    grad.addColorStop(1,   `rgba(2, 8, 14, 1)`);
+    ctx.fillStyle = grad;
+    ctx.fill();
+
+    // Rock edge highlight
+    ctx.strokeStyle = `rgba(0, ${80 + s*60}, ${100 + s*60}, 0.4)`;
+    ctx.lineWidth   = 1.2;
+    ctx.stroke();
+
+    // Subtle algae tint at base of floor rocks
+    if (isFloor) {
+      ctx.strokeStyle = `rgba(0, 180, 120, 0.15)`;
+      ctx.lineWidth   = 2.5;
+      ctx.beginPath();
+      ctx.moveTo(pts[0].x, pts[0].y);
+      for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+      ctx.stroke();
+    }
+
+    ctx.restore();
+  },
+
+  drawDebris(ob) {
+    ctx.save();
+    ctx.translate(0, ob.y);
+    ctx.rotate(ob.rotation);
+
+    const hw = ob.w / 2, hh = ob.h / 2;
+    const s  = ob.shade;
+
+    if (ob.variant === 0) {
+      // Pipe segment
+      const g = ctx.createLinearGradient(-hw, -hh, -hw, hh);
+      g.addColorStop(0,   `rgba(${20+s*15}, ${40+s*20}, ${50+s*25}, 0.9)`);
+      g.addColorStop(0.5, `rgba(${30+s*20}, ${55+s*25}, ${65+s*30}, 0.9)`);
+      g.addColorStop(1,   `rgba(${10+s*10}, ${25+s*12}, ${32+s*15}, 0.9)`);
+      ctx.fillStyle = g;
+      ctx.beginPath();
+      ctx.roundRect(-hw, -hh, ob.w, ob.h, 2);
+      ctx.fill();
+      ctx.strokeStyle = `rgba(0, ${100+s*80}, ${120+s*80}, 0.3)`;
+      ctx.lineWidth = 0.8;
+      ctx.stroke();
+      // Pipe end caps
+      ctx.fillStyle = `rgba(0, ${60+s*60}, ${80+s*60}, 0.5)`;
+      ctx.beginPath(); ctx.ellipse(-hw, 0, 3, hh, 0, 0, Math.PI*2); ctx.fill();
+      ctx.beginPath(); ctx.ellipse( hw, 0, 3, hh, 0, 0, Math.PI*2); ctx.fill();
+
+    } else if (ob.variant === 1) {
+      // Metal panel
+      ctx.fillStyle = `rgba(${10+s*12},${28+s*14},${36+s*18}, 0.88)`;
+      ctx.fillRect(-hw, -hh, ob.w, ob.h);
+      ctx.strokeStyle = `rgba(0, ${80+s*70}, ${100+s*70}, 0.35)`;
+      ctx.lineWidth = 0.8;
+      ctx.strokeRect(-hw, -hh, ob.w, ob.h);
+      // Rivet detail
+      ctx.fillStyle = `rgba(0, ${90+s*60}, ${110+s*60}, 0.4)`;
+      [[-hw+4,-hh+4],[hw-4,-hh+4],[-hw+4,hh-4],[hw-4,hh-4]].forEach(([rx,ry]) => {
+        ctx.beginPath(); ctx.arc(rx, ry, 1.5, 0, Math.PI*2); ctx.fill();
+      });
+
+    } else {
+      // Pressure sphere / canister
+      const rg = ctx.createRadialGradient(-hw*0.3, -hh*0.3, 0, 0, 0, hw);
+      rg.addColorStop(0,   `rgba(${20+s*20},${55+s*25},${70+s*30}, 0.9)`);
+      rg.addColorStop(0.7, `rgba(${8+s*10}, ${25+s*12},${35+s*15}, 0.9)`);
+      rg.addColorStop(1,   `rgba(2, 8, 14, 0.9)`);
+      ctx.fillStyle = rg;
+      ctx.beginPath();
+      ctx.ellipse(0, 0, hw, hh, 0, 0, Math.PI*2);
+      ctx.fill();
+      ctx.strokeStyle = `rgba(0, ${80+s*60}, ${100+s*60}, 0.35)`;
+      ctx.lineWidth = 0.8;
+      ctx.stroke();
+    }
+
+    ctx.restore();
+  },
+
+  drawCoral(ob) {
+    const sway = Math.sin(state.tick * ob.sway * 2 + ob.swayPhase) * 6;
+    ctx.save();
+    ctx.translate(0, ob.baseY);
+
+    // Branch count from width
+    const branches = 3 + Math.floor(ob.w / 4);
+    for (let b = 0; b < branches; b++) {
+      const bx = (b / (branches - 1) - 0.5) * ob.w * 1.8;
+      const bh = ob.h * (0.5 + (b % 2 === 0 ? 0.5 : 0.3));
+      const tipX = bx + sway * (bh / ob.h);
+
+      ctx.beginPath();
+      ctx.moveTo(bx, 0);
+      ctx.quadraticCurveTo(bx + sway * 0.5, -bh * 0.5, tipX, -bh);
+
+      const hue = ob.hue;
+      ctx.strokeStyle = `hsla(${hue}, 70%, ${35 + ob.shade * 25}%, 0.75)`;
+      ctx.lineWidth   = 1.5 + (branches - b) * 0.3;
+      ctx.lineCap     = 'round';
+      ctx.stroke();
+
+      // Tip glow
+      ctx.beginPath();
+      ctx.arc(tipX, -bh, 2.5, 0, Math.PI * 2);
+      ctx.fillStyle = `hsla(${hue}, 90%, 65%, 0.5)`;
+      ctx.fill();
+    }
+
+    ctx.restore();
+  },
+
+  // ── Collision detection ──
+  // Returns true if the player's ellipse overlaps any solid obstacle.
+  // Player hitbox is a shrunken ellipse (forgiving — feels fair, not cheap).
+  checkCollisions() {
+    const p   = state.player;
+    const phw = 28;   // player half-width  (hull is ~44px, use ~64% for leniency)
+    const phh = 9;    // player half-height
+
+    let hit = false;
+
+    // 1. Floor collision
+    const floorY = getFloorY(state.worldX + p.x);
+    if (p.y + phh > floorY) {
+      p.y  = floorY - phh;
+      p.vy = 0;
+      hit  = true;
+    }
+    // 2. Ceiling collision
+    if (p.y - phh < 0) {
+      p.y  = phh;
+      p.vy = 0;
+      hit  = true;
+    }
+
+    // 3. Obstacle AABB checks
+    const culling = 160;
+    obstacles.forEach(ob => {
+      const sx = ob.worldX - state.worldX;
+      if (sx < -culling || sx > LOGICAL_W + culling) return;
+
+      // AABB: obstacle box in screen space
+      const left   = sx + ob.bx;
+      const right  = sx + ob.bx + ob.bw;
+      const top    = ob.by;
+      const bottom = ob.by + ob.bh;
+
+      // Player AABB
+      const pl = p.x - phw;
+      const pr = p.x + phw;
+      const pt = p.y - phh;
+      const pb = p.y + phh;
+
+      if (pr > left && pl < right && pb > top && pt < bottom) {
+        hit = true;
+        // Push player out of the obstacle (find shallowest axis)
+        const overlapL = pr - left;
+        const overlapR = right - pl;
+        const overlapT = pb - top;
+        const overlapB = bottom - pt;
+        const minOv    = Math.min(overlapL, overlapR, overlapT, overlapB);
+        if      (minOv === overlapL) { p.x -= overlapL * 0.5; p.vx *= -0.3; }
+        else if (minOv === overlapR) { p.x += overlapR * 0.5; p.vx *= -0.3; }
+        else if (minOv === overlapT) { p.y -= overlapT * 0.5; p.vy *= -0.3; }
+        else                         { p.y += overlapB * 0.5; p.vy *= -0.3; }
+      }
+    });
+
+    state.colliding = hit;
+    return hit;
+  },
+};
+
+
+
+function update() {
+  if (!state.running) return;
+
+  state.tick++;
+
+  // Scroll the world
+  state.worldX += CFG.SCROLL_SPEED;
+
+  // Update sub-systems
+  updateParticles();
+  updatePlayer();
+
+  // Collision detection (after player position is updated)
+  obstacleSystem.checkCollisions();
+
+  // Update HUD elements
+  updateHUD();
+}
+
+
+// ─── HUD UPDATES ────────────────────────────────────────────────────────────
+const oxyFill  = document.getElementById('oxy-bar-fill');
+const depthVal = document.getElementById('depth-value');
+
+function updateHUD() {
+  // Oxygen bar width
+  const pct = (state.oxygen / CFG.OXY_MAX) * 100;
+  oxyFill.style.width = pct + '%';
+
+  // Colour shifts to red when critical (≤ 25%)
+  if (pct <= 25) {
+    oxyFill.style.background = `linear-gradient(90deg, #c0392b, #e74c3c)`;
+    oxyFill.style.boxShadow  = '0 0 10px rgba(220,50,50,0.7)';
+  } else if (pct <= 50) {
+    oxyFill.style.background = `linear-gradient(90deg, #e67e22, #f39c12)`;
+    oxyFill.style.boxShadow  = '0 0 8px rgba(230,120,30,0.6)';
+  } else {
+    oxyFill.style.background = `linear-gradient(90deg, #00c8a0, #00ecd4)`;
+    oxyFill.style.boxShadow  = '0 0 8px rgba(0,230,200,0.6)';
+  }
+
+  // Depth — derived from vertical position + world progress
+  // Surface = 0m, bottom = ~2400m (arbitrary cinematic scale)
+  const depthM = Math.round(
+    (state.player.y / LOGICAL_H) * 800 +
+    (state.worldX / CFG.WORLD_LENGTH) * 1600
+  );
+  depthVal.textContent = depthM + 'm';
+}
+
+
+// ─── 10. RENDER LOGIC ────────────────────────────────────────────────────────
+function render() {
+  // Clear
+  ctx.clearRect(0, 0, LOGICAL_W, LOGICAL_H);
+
+  // Layer order (back → front):
+  drawBackground();
+  drawSurfaceCaustics();
+  drawParticles();
+
+  // Obstacles sit behind the player but above background
+  obstacleSystem.draw();   // draws rocks, debris, coral
+  drawFloor();             // procedural floor (drawn on top to cover rock bases)
+
+  // Player — position includes idle bob
+  const p = state.player;
+  drawSubmarine(p.x, p.y + p.bobOffset);
+
+  // World progress indicator (thin bar at very bottom)
+  drawProgressBar();
+
+  // UI overlay effects
+  drawScanlines();
+}
+
+// Thin progress bar showing how far through the level the player is
+function drawProgressBar() {
+  const progress = Math.min(state.worldX / CFG.WORLD_LENGTH, 1);
+  const barH = 2;
+  const barY = LOGICAL_H - barH;
+
+  // Track
+  ctx.fillStyle = 'rgba(0, 40, 60, 0.6)';
+  ctx.fillRect(0, barY, LOGICAL_W, barH);
+
+  // Fill
+  ctx.fillStyle = 'rgba(0, 180, 200, 0.5)';
+  ctx.fillRect(0, barY, LOGICAL_W * progress, barH);
+
+  // Beacon marker at the end
+  ctx.fillStyle = 'rgba(255, 180, 60, 0.7)';
+  ctx.fillRect(LOGICAL_W - 3, barY - 1, 3, barH + 2);
+}
+
+
+// ─── 11. GAME LOOP ───────────────────────────────────────────────────────────
+function gameLoop() {
+  update();
+  render();
+  requestAnimationFrame(gameLoop);
+}
+
+// Kick it off
+requestAnimationFrame(gameLoop);
+</script>
+</body>
+</html>
