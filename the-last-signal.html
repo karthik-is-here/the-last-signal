@@ -178,7 +178,7 @@
 
 <script>
 // ═══════════════════════════════════════════════════════════════════════════
-//  THE LAST SIGNAL — Step 2: Obstacles & World
+//  THE LAST SIGNAL — Step 3: Fixed Rocks + Creatures
 //  Sections:
 //    1. Canvas Setup
 //    2. Constants & Config
@@ -187,10 +187,11 @@
 //    5. Player (submarine)
 //    6. Input Handling
 //    7. Draw Helpers
-//    8. Obstacle System          ← NEW
-//    9. Update Logic
-//   10. Render Logic
-//   11. Game Loop
+//    8. Obstacle System (rocks fixed, debris, coral)
+//    9. Creature System          ← NEW
+//   10. Update Logic
+//   11. Render Logic
+//   12. Game Loop
 // ═══════════════════════════════════════════════════════════════════════════
 
 
@@ -241,10 +242,14 @@ const CFG = {
   BOB_SPEED:       0.04,   // radians per frame
 
   // Obstacles
-  ROCK_SPACING:    310,    // world-units between rock cluster attempts
-  ROCK_GAP_MIN:    155,    // minimum vertical gap the player can pass through
+  ROCK_SPACING:    340,    // world-units between rock gate pairs
+  ROCK_GAP_MIN:    160,    // minimum vertical gap the player can pass through
+  ROCK_GAP_MAX:    220,    // maximum gap — decreases challenge if too large
   DEBRIS_SPACING:  420,    // world-units between mid-water debris chunks
-  CORAL_SPACING:   500,    // world-units between coral clusters
+  CORAL_SPACING:   480,    // world-units between coral clusters
+
+  // Creatures
+  CREATURE_SPACING: 900,   // world-units between creature spawn attempts
 
   // Debug — set true to see collision boxes
   DEBUG:           false,
@@ -616,21 +621,18 @@ function drawScanlines() {
 
 
 // ─── 8. OBSTACLE SYSTEM ─────────────────────────────────────────────────────
-// Design philosophy:
-//   • All obstacles are generated ahead of time as world-space objects.
-//   • Each object stores its world-X position. To draw it we compute:
-//       screenX = obj.worldX - state.worldX
-//   • Objects far off-screen (left or right) are skipped — cheap culling.
-//   • Three obstacle types:
-//       1. RockPair   — floor spike + optional ceiling spike forming a gate
-//       2. Debris     — mid-water drifting wreckage chunks
-//       3. Coral      — floor-anchored decorative clusters (also solid)
-//   • A seeded PRNG means the level is the same every run (fair deaths).
-//   • Collision uses AABB (axis-aligned bounding box) for rocks/debris
-//     and a circle check for coral.
+//
+// Rock fix rationale:
+//   Old approach computed gap from ceilY=0 to floorY, but drew rocks with
+//   relative polygon points that didn't match world-space Y positions.
+//   New approach: rocks are drawn as filled paths FROM the screen edge
+//   (top=0 for ceiling, floorY for floor), reaching a computed tip Y.
+//   Gap is guaranteed by clamping tipY values so passage is always >= GAP_MIN.
+//
+//   makeRockPoints now uses smoothed mid-point displacement so the silhouette
+//   looks like real rock, not a random comb.
 
 // ── Seeded PRNG (Mulberry32) ──────────────────────────────────────────────
-// Using a seeded generator so the obstacle layout is deterministic.
 function mulberry32(seed) {
   return function() {
     seed |= 0; seed = seed + 0x6D2B79F5 | 0;
@@ -642,308 +644,296 @@ function mulberry32(seed) {
 const rng = mulberry32(0xDEADBEEF);
 
 // ── Floor heightmap ───────────────────────────────────────────────────────
-// We pre-bake a smooth floor height curve across the whole world.
-// This drives both visuals AND rock placement.
-const FLOOR_SAMPLES = 420;                         // one sample every ~28.6 world-px
+const FLOOR_SAMPLES = 420;
 const floorHeights  = new Float32Array(FLOOR_SAMPLES);
 
 (function generateFloor() {
-  // Layered sine waves give organic variation
   for (let i = 0; i < FLOOR_SAMPLES; i++) {
     const t = i / FLOOR_SAMPLES;
     const h =
       Math.sin(t * Math.PI * 6  + 0.3) * 22 +
       Math.sin(t * Math.PI * 13 + 1.1) * 12 +
       Math.sin(t * Math.PI * 28 + 2.4) * 6  +
-      rng() * 8;                                   // high-freq noise
-    floorHeights[i] = LOGICAL_H - 58 + h;         // base floor Y + variation
+      rng() * 8;
+    floorHeights[i] = LOGICAL_H - 62 + h;
   }
 })();
 
 function getFloorY(worldX) {
-  // Interpolate floor height at any world-x position
-  const t   = (worldX / CFG.WORLD_LENGTH) * (FLOOR_SAMPLES - 1);
-  const i0  = Math.floor(t) % FLOOR_SAMPLES;
-  const i1  = (i0 + 1) % FLOOR_SAMPLES;
-  const frac = t - Math.floor(t);
+  const t    = Math.max(0, (worldX / CFG.WORLD_LENGTH)) * (FLOOR_SAMPLES - 1);
+  const i0   = Math.min(Math.floor(t), FLOOR_SAMPLES - 2);
+  const i1   = i0 + 1;
+  const frac = t - i0;
   return floorHeights[i0] * (1 - frac) + floorHeights[i1] * frac;
 }
 
-// ── Obstacle generation ───────────────────────────────────────────────────
-const obstacles = [];   // all obstacle objects live here
+// ── Rock polygon helper ───────────────────────────────────────────────────
+// Builds a smooth-ish jagged silhouette using midpoint displacement.
+// anchor='ceiling': polygon goes from y=0 (top edge) down to tipY.
+// anchor='floor':   polygon goes from y=floorY (floor edge) up to tipY.
+// All coordinates are in SCREEN SPACE — no extra translation needed.
+function makeRockPoly(cx, anchor, tipY, floorY, w, rand) {
+  // Number of x-segments along the rock face
+  const segs  = 5 + Math.floor(rand() * 3);   // 5–7 segments
+  const half  = w / 2;
+  const xs    = [];
+  for (let i = 0; i <= segs; i++) xs.push(cx - half + (w / segs) * i);
 
-(function generateObstacles() {
-  // ── 1. Rock pairs ──
-  // Spaced every ROCK_SPACING world-units; skip the first 600px (player spawn buffer)
-  for (let wx = 800; wx < CFG.WORLD_LENGTH - 400; wx += CFG.ROCK_SPACING + (rng() - 0.5) * 120) {
-    const floorY   = getFloorY(wx);
-    const ceilY    = 0;                             // ceiling is top of screen
-    const gapH     = CFG.ROCK_GAP_MIN + rng() * 80; // passage height
-    const gapCentre = ceilY + (floorY - ceilY) * (0.25 + rng() * 0.5);
+  // Generate raw tip heights with midpoint displacement for smoother look
+  // Start with straight line at tipY, then displace midpoints
+  const ys = new Array(segs + 1).fill(tipY);
 
-    const topH    = gapCentre - gapH / 2;           // height of ceiling spike
-    const botY    = gapCentre + gapH / 2;           // top of floor spike
-    const botH    = floorY - botY;
-
-    const w = 38 + rng() * 24;                      // rock width varies
-
-    // Ceiling rock (only if there's enough height to be meaningful)
-    if (topH > 20) {
-      obstacles.push({
-        type: 'rock',
-        anchor: 'ceiling',
-        worldX: wx,
-        w, h: topH,
-        // AABB in local coords (relative to worldX, top-anchored)
-        bx: -w / 2, by: 0, bw: w, bh: topH,
-        // Visual shape: array of {x,y} points for a jagged polygon
-        points: makeRockPoints(w, topH, 'ceiling', rng),
-        shade: 0.5 + rng() * 0.5,
-      });
+  // One pass of midpoint displacement
+  function displace(l, r, depth) {
+    if (r - l <= 1) return;
+    const mid   = (l + r) >> 1;
+    const range = (r - l) / segs;   // displacement scales with span
+    if (anchor === 'ceiling') {
+      // Ceiling rock tips point downward — displace toward floorY
+      ys[mid] = (ys[l] + ys[r]) / 2 + (rand() - 0.3) * tipY * range * 0.5;
+      ys[mid] = Math.min(ys[mid], tipY * 0.95);   // don't exceed tip
+      ys[mid] = Math.max(ys[mid], 4);
+    } else {
+      // Floor rock tips point upward — displace toward 0
+      ys[mid] = (ys[l] + ys[r]) / 2 + (rand() - 0.3) * (floorY - tipY) * range * 0.5;
+      ys[mid] = Math.max(ys[mid], tipY * 1.02);
+      ys[mid] = Math.min(ys[mid], floorY - 4);
     }
-
-    // Floor rock
-    if (botH > 12) {
-      obstacles.push({
-        type: 'rock',
-        anchor: 'floor',
-        worldX: wx,
-        w, h: botH,
-        bx: -w / 2, by: botY, bw: w, bh: botH,
-        points: makeRockPoints(w, botH, 'floor', rng),
-        baseY: botY,
-        shade: 0.5 + rng() * 0.5,
-      });
-    }
+    displace(l, mid, depth + 1);
+    displace(mid, r, depth + 1);
   }
+  displace(0, segs, 0);
 
-  // ── 2. Debris chunks ──
-  for (let wx = 500; wx < CFG.WORLD_LENGTH - 200; wx += CFG.DEBRIS_SPACING + (rng() - 0.5) * 160) {
-    const floorY = getFloorY(wx);
-    const count  = 2 + Math.floor(rng() * 4);
-    for (let c = 0; c < count; c++) {
-      const dw   = 14 + rng() * 28;
-      const dh   = 8  + rng() * 18;
-      const dy   = 80 + rng() * (floorY - 140);
-      const dx   = (rng() - 0.5) * 60;
-      obstacles.push({
-        type:   'debris',
-        worldX: wx + dx,
-        w: dw, h: dh,
-        bx: -dw / 2, by: dy - dh / 2, bw: dw, bh: dh,
-        y:  dy,
-        rotation: rng() * Math.PI,
-        shade:    rng(),
-        variant:  Math.floor(rng() * 3),  // 0=pipe, 1=panel, 2=sphere
-      });
-    }
-  }
-
-  // ── 3. Coral clusters ──
-  for (let wx = 400; wx < CFG.WORLD_LENGTH - 300; wx += CFG.CORAL_SPACING + (rng() - 0.5) * 200) {
-    const floorY = getFloorY(wx);
-    const count  = 3 + Math.floor(rng() * 5);
-    for (let c = 0; c < count; c++) {
-      const cx    = (rng() - 0.5) * 80;
-      const ch    = 18 + rng() * 36;
-      const cw    = 5  + rng() * 8;
-      obstacles.push({
-        type:   'coral',
-        worldX: wx + cx,
-        baseY:  floorY,
-        h: ch, w: cw,
-        bx: -cw, by: floorY - ch, bw: cw * 2, bh: ch,
-        hue:    rng() > 0.5 ? 160 : 280,  // teal or purple coral
-        shade:  0.6 + rng() * 0.4,
-        sway:   (rng() - 0.5) * 0.04,     // sway speed
-        swayPhase: rng() * Math.PI * 2,
-      });
-    }
-  }
-})();
-
-// Helper: make a jagged rock polygon
-function makeRockPoints(w, h, anchor, rand) {
-  const pts   = [];
-  const segs  = 6 + Math.floor(rand() * 4);
-  // Base edge runs full width
+  // Build polygon: base edge → jagged face → close
+  const pts = [];
   if (anchor === 'ceiling') {
-    pts.push({ x: -w / 2, y: 0 });
-    for (let i = 0; i <= segs; i++) {
-      const fx = -w / 2 + (w / segs) * i;
-      const fy = h * (0.6 + rand() * 0.4);
-      pts.push({ x: fx, y: fy });
-    }
-    pts.push({ x: w / 2, y: 0 });
+    pts.push({ x: cx - half, y: 0 });             // top-left corner
+    for (let i = 0; i <= segs; i++) pts.push({ x: xs[i], y: ys[i] }); // jagged bottom
+    pts.push({ x: cx + half, y: 0 });             // top-right corner
   } else {
-    pts.push({ x: -w / 2, y: h });
-    for (let i = 0; i <= segs; i++) {
-      const fx = -w / 2 + (w / segs) * i;
-      const fy = -(h * (0.6 + rand() * 0.4));
-      pts.push({ x: fx, y: fy });
-    }
-    pts.push({ x: w / 2, y: h });
+    pts.push({ x: cx - half, y: floorY });         // bottom-left corner
+    for (let i = 0; i <= segs; i++) pts.push({ x: xs[i], y: ys[i] }); // jagged top
+    pts.push({ x: cx + half, y: floorY });         // bottom-right corner
   }
   return pts;
 }
 
-// ── Obstacle draw functions ───────────────────────────────────────────────
+// ── Obstacle generation ───────────────────────────────────────────────────
+const obstacles = [];
+
+(function generateObstacles() {
+
+  // ── 1. Rock gate pairs ─────────────────────────────────────────────────
+  // Each gate = one ceiling rock + one floor rock with a guaranteed gap.
+  // Gap centre is biased toward screen middle (0.3–0.7 of usable height).
+  for (let wx = 900; wx < CFG.WORLD_LENGTH - 500; wx += CFG.ROCK_SPACING + (rng() - 0.5) * 100) {
+
+    const floorY  = getFloorY(wx);
+    const usable  = floorY;                        // 0..floorY is navigable space
+    const gapH    = CFG.ROCK_GAP_MIN + rng() * (CFG.ROCK_GAP_MAX - CFG.ROCK_GAP_MIN);
+
+    // Gap centre: keep it away from extreme top/bottom so both rocks are visible
+    const minCentre = gapH * 0.6 + 30;
+    const maxCentre = usable - gapH * 0.6 - 30;
+    if (maxCentre <= minCentre) continue;          // screen too narrow — skip
+    const gapCentre = minCentre + rng() * (maxCentre - minCentre);
+
+    const gapTop  = gapCentre - gapH / 2;         // Y where gap starts (top)
+    const gapBot  = gapCentre + gapH / 2;         // Y where gap ends (bottom)
+
+    const w = 44 + rng() * 28;                    // rock width 44–72px
+
+    // Ceiling rock: hangs from y=0, tip reaches down to gapTop
+    if (gapTop > 20) {
+      const pts = makeRockPoly(0, 'ceiling', gapTop, floorY, w, rng);
+      obstacles.push({
+        type: 'rock', anchor: 'ceiling',
+        worldX: wx, w, h: gapTop,
+        bx: -w / 2, by: 0, bw: w, bh: gapTop,
+        pts, shade: 0.4 + rng() * 0.6,
+      });
+    }
+
+    // Floor rock: rises from floorY, tip reaches up to gapBot
+    const floorRockH = floorY - gapBot;
+    if (floorRockH > 16) {
+      const pts = makeRockPoly(0, 'floor', gapBot, floorY, w, rng);
+      obstacles.push({
+        type: 'rock', anchor: 'floor',
+        worldX: wx, w, h: floorRockH,
+        bx: -w / 2, by: gapBot, bw: w, bh: floorRockH,
+        pts, shade: 0.4 + rng() * 0.6,
+      });
+    }
+  }
+
+  // ── 2. Debris chunks ──────────────────────────────────────────────────
+  for (let wx = 500; wx < CFG.WORLD_LENGTH - 200; wx += CFG.DEBRIS_SPACING + (rng() - 0.5) * 160) {
+    const floorY = getFloorY(wx);
+    const count  = 2 + Math.floor(rng() * 4);
+    for (let c = 0; c < count; c++) {
+      const dw = 14 + rng() * 28;
+      const dh = 8  + rng() * 18;
+      const dy = 80 + rng() * (floorY - 140);
+      const dx = (rng() - 0.5) * 60;
+      obstacles.push({
+        type: 'debris', worldX: wx + dx,
+        w: dw, h: dh,
+        bx: -dw / 2, by: dy - dh / 2, bw: dw, bh: dh,
+        y: dy, rotation: rng() * Math.PI,
+        shade: rng(), variant: Math.floor(rng() * 3),
+      });
+    }
+  }
+
+  // ── 3. Coral clusters ────────────────────────────────────────────────
+  for (let wx = 400; wx < CFG.WORLD_LENGTH - 300; wx += CFG.CORAL_SPACING + (rng() - 0.5) * 180) {
+    const floorY = getFloorY(wx);
+    const count  = 3 + Math.floor(rng() * 5);
+    for (let c = 0; c < count; c++) {
+      const cx = (rng() - 0.5) * 80;
+      const ch = 18 + rng() * 36;
+      const cw = 5  + rng() * 8;
+      obstacles.push({
+        type: 'coral', worldX: wx + cx, baseY: floorY,
+        h: ch, w: cw,
+        bx: -cw, by: floorY - ch, bw: cw * 2, bh: ch,
+        hue: rng() > 0.5 ? 160 : 280,
+        shade: 0.6 + rng() * 0.4,
+        sway: (rng() - 0.5) * 0.04,
+        swayPhase: rng() * Math.PI * 2,
+      });
+    }
+  }
+
+})();
+
+// ── Obstacle draw & collision ──────────────────────────────────────────────
 
 const obstacleSystem = {
 
-  // ── Draw the procedural floor ──
   drawFloor() {
     ctx.save();
     ctx.beginPath();
     ctx.moveTo(0, LOGICAL_H);
     for (let sx = 0; sx <= LOGICAL_W; sx += 4) {
-      const wx  = state.worldX + sx;
-      const fy  = getFloorY(wx);
-      ctx.lineTo(sx, fy);
+      ctx.lineTo(sx, getFloorY(state.worldX + sx));
     }
     ctx.lineTo(LOGICAL_W, LOGICAL_H);
     ctx.closePath();
-
     const grad = ctx.createLinearGradient(0, LOGICAL_H - 80, 0, LOGICAL_H);
     grad.addColorStop(0,   '#011520');
     grad.addColorStop(0.4, '#010c18');
     grad.addColorStop(1,   '#000508');
     ctx.fillStyle = grad;
     ctx.fill();
-
-    // Glowing floor edge
+    // Glowing edge
     ctx.strokeStyle = 'rgba(0, 100, 140, 0.35)';
     ctx.lineWidth   = 1.5;
     ctx.beginPath();
     for (let sx = 0; sx <= LOGICAL_W; sx += 4) {
-      const wx = state.worldX + sx;
-      const fy = getFloorY(wx);
+      const fy = getFloorY(state.worldX + sx);
       sx === 0 ? ctx.moveTo(sx, fy) : ctx.lineTo(sx, fy);
     }
     ctx.stroke();
     ctx.restore();
   },
 
-  // ── Draw all visible obstacles ──
   draw() {
-    const cullingMargin = 120;
-    obstacles.forEach(ob => {
-      const sx = ob.worldX - state.worldX;   // screen-space X
-      if (sx < -cullingMargin || sx > LOGICAL_W + cullingMargin) return;
-
+    const margin = 140;
+    for (const ob of obstacles) {
+      const sx = ob.worldX - state.worldX;
+      if (sx < -margin || sx > LOGICAL_W + margin) continue;
       ctx.save();
       ctx.translate(sx, 0);
-
       if      (ob.type === 'rock')   this.drawRock(ob);
       else if (ob.type === 'debris') this.drawDebris(ob);
       else if (ob.type === 'coral')  this.drawCoral(ob);
-
-      // Debug bounding boxes
       if (CFG.DEBUG) {
-        ctx.strokeStyle = 'rgba(255,0,0,0.7)';
-        ctx.lineWidth = 1;
+        ctx.strokeStyle = 'rgba(255,0,0,0.75)';
+        ctx.lineWidth   = 1;
         ctx.strokeRect(ob.bx, ob.by, ob.bw, ob.bh);
       }
-
       ctx.restore();
-    });
+    }
   },
 
   drawRock(ob) {
-    const pts = ob.points;
+    const pts = ob.pts;
     if (!pts || pts.length < 3) return;
+    const s = ob.shade;
 
-    const baseY = ob.anchor === 'floor' ? ob.baseY : 0;
-    ctx.save();
-    ctx.translate(0, baseY);
-
-    // Rock body
+    // Rock body — filled polygon (pts are already in screen-space Y)
     ctx.beginPath();
     ctx.moveTo(pts[0].x, pts[0].y);
     for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
     ctx.closePath();
 
-    const isFloor = ob.anchor === 'floor';
-    const grad = ctx.createLinearGradient(0, isFloor ? 0 : ob.h, 0, isFloor ? -ob.h : 0);
-    const s = ob.shade;
-    grad.addColorStop(0,   `rgba(${8 + s*20},${22 + s*18},${30 + s*22}, 1)`);
-    grad.addColorStop(0.5, `rgba(${4 + s*12},${14 + s*10},${20 + s*14}, 1)`);
-    grad.addColorStop(1,   `rgba(2, 8, 14, 1)`);
+    // Gradient: darker toward screen edge, lighter at the exposed tip
+    const tipY   = ob.anchor === 'ceiling' ? ob.h : ob.by;
+    const edgeY  = ob.anchor === 'ceiling' ? 0 : ob.by + ob.h;
+    const grad   = ctx.createLinearGradient(0, edgeY, 0, tipY);
+    grad.addColorStop(0,    `rgba(2, 8, 14, 1)`);
+    grad.addColorStop(0.55, `rgba(${6+s*16}, ${16+s*14}, ${22+s*18}, 1)`);
+    grad.addColorStop(1,    `rgba(${12+s*22}, ${28+s*18}, ${36+s*22}, 1)`);
     ctx.fillStyle = grad;
     ctx.fill();
 
-    // Rock edge highlight
-    ctx.strokeStyle = `rgba(0, ${80 + s*60}, ${100 + s*60}, 0.4)`;
-    ctx.lineWidth   = 1.2;
+    // Silhouette edge glow
+    ctx.strokeStyle = `rgba(0, ${70+s*80}, ${90+s*80}, 0.45)`;
+    ctx.lineWidth   = 1.4;
     ctx.stroke();
 
-    // Subtle algae tint at base of floor rocks
-    if (isFloor) {
-      ctx.strokeStyle = `rgba(0, 180, 120, 0.15)`;
-      ctx.lineWidth   = 2.5;
-      ctx.beginPath();
-      ctx.moveTo(pts[0].x, pts[0].y);
-      for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
-      ctx.stroke();
-    }
-
-    ctx.restore();
+    // Algae/moss tint along the jagged face
+    ctx.strokeStyle = `rgba(0, 160, 100, 0.12)`;
+    ctx.lineWidth   = 2.5;
+    ctx.beginPath();
+    // Only stroke the jagged silhouette edge, not the base
+    const start = 1;
+    const end   = pts.length - 2;
+    ctx.moveTo(pts[start].x, pts[start].y);
+    for (let i = start + 1; i <= end; i++) ctx.lineTo(pts[i].x, pts[i].y);
+    ctx.stroke();
   },
 
   drawDebris(ob) {
     ctx.save();
     ctx.translate(0, ob.y);
     ctx.rotate(ob.rotation);
-
     const hw = ob.w / 2, hh = ob.h / 2;
     const s  = ob.shade;
 
     if (ob.variant === 0) {
-      // Pipe segment
       const g = ctx.createLinearGradient(-hw, -hh, -hw, hh);
-      g.addColorStop(0,   `rgba(${20+s*15}, ${40+s*20}, ${50+s*25}, 0.9)`);
-      g.addColorStop(0.5, `rgba(${30+s*20}, ${55+s*25}, ${65+s*30}, 0.9)`);
-      g.addColorStop(1,   `rgba(${10+s*10}, ${25+s*12}, ${32+s*15}, 0.9)`);
+      g.addColorStop(0,   `rgba(${20+s*15},${40+s*20},${50+s*25},0.9)`);
+      g.addColorStop(0.5, `rgba(${30+s*20},${55+s*25},${65+s*30},0.9)`);
+      g.addColorStop(1,   `rgba(${10+s*10},${25+s*12},${32+s*15},0.9)`);
       ctx.fillStyle = g;
-      ctx.beginPath();
-      ctx.roundRect(-hw, -hh, ob.w, ob.h, 2);
-      ctx.fill();
-      ctx.strokeStyle = `rgba(0, ${100+s*80}, ${120+s*80}, 0.3)`;
-      ctx.lineWidth = 0.8;
-      ctx.stroke();
-      // Pipe end caps
-      ctx.fillStyle = `rgba(0, ${60+s*60}, ${80+s*60}, 0.5)`;
-      ctx.beginPath(); ctx.ellipse(-hw, 0, 3, hh, 0, 0, Math.PI*2); ctx.fill();
-      ctx.beginPath(); ctx.ellipse( hw, 0, 3, hh, 0, 0, Math.PI*2); ctx.fill();
-
+      ctx.beginPath(); ctx.roundRect(-hw,-hh,ob.w,ob.h,2); ctx.fill();
+      ctx.strokeStyle = `rgba(0,${100+s*80},${120+s*80},0.3)`;
+      ctx.lineWidth = 0.8; ctx.stroke();
+      ctx.fillStyle = `rgba(0,${60+s*60},${80+s*60},0.5)`;
+      ctx.beginPath(); ctx.ellipse(-hw,0,3,hh,0,0,Math.PI*2); ctx.fill();
+      ctx.beginPath(); ctx.ellipse( hw,0,3,hh,0,0,Math.PI*2); ctx.fill();
     } else if (ob.variant === 1) {
-      // Metal panel
-      ctx.fillStyle = `rgba(${10+s*12},${28+s*14},${36+s*18}, 0.88)`;
-      ctx.fillRect(-hw, -hh, ob.w, ob.h);
-      ctx.strokeStyle = `rgba(0, ${80+s*70}, ${100+s*70}, 0.35)`;
-      ctx.lineWidth = 0.8;
-      ctx.strokeRect(-hw, -hh, ob.w, ob.h);
-      // Rivet detail
-      ctx.fillStyle = `rgba(0, ${90+s*60}, ${110+s*60}, 0.4)`;
-      [[-hw+4,-hh+4],[hw-4,-hh+4],[-hw+4,hh-4],[hw-4,hh-4]].forEach(([rx,ry]) => {
-        ctx.beginPath(); ctx.arc(rx, ry, 1.5, 0, Math.PI*2); ctx.fill();
+      ctx.fillStyle = `rgba(${10+s*12},${28+s*14},${36+s*18},0.88)`;
+      ctx.fillRect(-hw,-hh,ob.w,ob.h);
+      ctx.strokeStyle = `rgba(0,${80+s*70},${100+s*70},0.35)`;
+      ctx.lineWidth = 0.8; ctx.strokeRect(-hw,-hh,ob.w,ob.h);
+      ctx.fillStyle = `rgba(0,${90+s*60},${110+s*60},0.4)`;
+      [[-hw+4,-hh+4],[hw-4,-hh+4],[-hw+4,hh-4],[hw-4,hh-4]].forEach(([rx,ry])=>{
+        ctx.beginPath(); ctx.arc(rx,ry,1.5,0,Math.PI*2); ctx.fill();
       });
-
     } else {
-      // Pressure sphere / canister
-      const rg = ctx.createRadialGradient(-hw*0.3, -hh*0.3, 0, 0, 0, hw);
-      rg.addColorStop(0,   `rgba(${20+s*20},${55+s*25},${70+s*30}, 0.9)`);
-      rg.addColorStop(0.7, `rgba(${8+s*10}, ${25+s*12},${35+s*15}, 0.9)`);
-      rg.addColorStop(1,   `rgba(2, 8, 14, 0.9)`);
+      const rg = ctx.createRadialGradient(-hw*.3,-hh*.3,0,0,0,hw);
+      rg.addColorStop(0,   `rgba(${20+s*20},${55+s*25},${70+s*30},0.9)`);
+      rg.addColorStop(0.7, `rgba(${8+s*10},${25+s*12},${35+s*15},0.9)`);
+      rg.addColorStop(1,   `rgba(2,8,14,0.9)`);
       ctx.fillStyle = rg;
-      ctx.beginPath();
-      ctx.ellipse(0, 0, hw, hh, 0, 0, Math.PI*2);
-      ctx.fill();
-      ctx.strokeStyle = `rgba(0, ${80+s*60}, ${100+s*60}, 0.35)`;
-      ctx.lineWidth = 0.8;
-      ctx.stroke();
+      ctx.beginPath(); ctx.ellipse(0,0,hw,hh,0,0,Math.PI*2); ctx.fill();
+      ctx.strokeStyle = `rgba(0,${80+s*60},${100+s*60},0.35)`;
+      ctx.lineWidth = 0.8; ctx.stroke();
     }
-
     ctx.restore();
   },
 
@@ -951,95 +941,312 @@ const obstacleSystem = {
     const sway = Math.sin(state.tick * ob.sway * 2 + ob.swayPhase) * 6;
     ctx.save();
     ctx.translate(0, ob.baseY);
-
-    // Branch count from width
     const branches = 3 + Math.floor(ob.w / 4);
     for (let b = 0; b < branches; b++) {
-      const bx = (b / (branches - 1) - 0.5) * ob.w * 1.8;
-      const bh = ob.h * (0.5 + (b % 2 === 0 ? 0.5 : 0.3));
+      const bx  = (b / (branches - 1) - 0.5) * ob.w * 1.8;
+      const bh  = ob.h * (0.5 + (b % 2 === 0 ? 0.5 : 0.3));
       const tipX = bx + sway * (bh / ob.h);
-
       ctx.beginPath();
       ctx.moveTo(bx, 0);
       ctx.quadraticCurveTo(bx + sway * 0.5, -bh * 0.5, tipX, -bh);
-
-      const hue = ob.hue;
-      ctx.strokeStyle = `hsla(${hue}, 70%, ${35 + ob.shade * 25}%, 0.75)`;
+      ctx.strokeStyle = `hsla(${ob.hue},70%,${35+ob.shade*25}%,0.75)`;
       ctx.lineWidth   = 1.5 + (branches - b) * 0.3;
       ctx.lineCap     = 'round';
       ctx.stroke();
-
-      // Tip glow
-      ctx.beginPath();
-      ctx.arc(tipX, -bh, 2.5, 0, Math.PI * 2);
-      ctx.fillStyle = `hsla(${hue}, 90%, 65%, 0.5)`;
+      ctx.beginPath(); ctx.arc(tipX, -bh, 2.5, 0, Math.PI*2);
+      ctx.fillStyle = `hsla(${ob.hue},90%,65%,0.5)`;
       ctx.fill();
     }
-
     ctx.restore();
   },
 
-  // ── Collision detection ──
-  // Returns true if the player's ellipse overlaps any solid obstacle.
-  // Player hitbox is a shrunken ellipse (forgiving — feels fair, not cheap).
   checkCollisions() {
     const p   = state.player;
-    const phw = 28;   // player half-width  (hull is ~44px, use ~64% for leniency)
-    const phh = 9;    // player half-height
+    const phw = 26;
+    const phh = 8;
+    let hit   = false;
 
-    let hit = false;
-
-    // 1. Floor collision
+    // Floor
     const floorY = getFloorY(state.worldX + p.x);
-    if (p.y + phh > floorY) {
-      p.y  = floorY - phh;
-      p.vy = 0;
-      hit  = true;
-    }
-    // 2. Ceiling collision
-    if (p.y - phh < 0) {
-      p.y  = phh;
-      p.vy = 0;
-      hit  = true;
-    }
+    if (p.y + phh > floorY) { p.y = floorY - phh; p.vy = 0; hit = true; }
+    // Ceiling
+    if (p.y - phh < 8)      { p.y = 8 + phh;      p.vy = 0; hit = true; }
 
-    // 3. Obstacle AABB checks
-    const culling = 160;
-    obstacles.forEach(ob => {
+    // Obstacles AABB
+    for (const ob of obstacles) {
       const sx = ob.worldX - state.worldX;
-      if (sx < -culling || sx > LOGICAL_W + culling) return;
-
-      // AABB: obstacle box in screen space
-      const left   = sx + ob.bx;
-      const right  = sx + ob.bx + ob.bw;
-      const top    = ob.by;
-      const bottom = ob.by + ob.bh;
-
-      // Player AABB
-      const pl = p.x - phw;
-      const pr = p.x + phw;
-      const pt = p.y - phh;
-      const pb = p.y + phh;
-
+      if (sx < -160 || sx > LOGICAL_W + 160) continue;
+      const left   = sx + ob.bx,  right  = sx + ob.bx + ob.bw;
+      const top    = ob.by,       bottom = ob.by + ob.bh;
+      const pl = p.x - phw, pr = p.x + phw;
+      const pt = p.y - phh, pb = p.y + phh;
       if (pr > left && pl < right && pb > top && pt < bottom) {
         hit = true;
-        // Push player out of the obstacle (find shallowest axis)
-        const overlapL = pr - left;
-        const overlapR = right - pl;
-        const overlapT = pb - top;
-        const overlapB = bottom - pt;
-        const minOv    = Math.min(overlapL, overlapR, overlapT, overlapB);
-        if      (minOv === overlapL) { p.x -= overlapL * 0.5; p.vx *= -0.3; }
-        else if (minOv === overlapR) { p.x += overlapR * 0.5; p.vx *= -0.3; }
-        else if (minOv === overlapT) { p.y -= overlapT * 0.5; p.vy *= -0.3; }
-        else                         { p.y += overlapB * 0.5; p.vy *= -0.3; }
+        const oL = pr-left, oR = right-pl, oT = pb-top, oB = bottom-pt;
+        const mn = Math.min(oL,oR,oT,oB);
+        if      (mn===oL){ p.x -= oL*0.5; p.vx*=-0.3; }
+        else if (mn===oR){ p.x += oR*0.5; p.vx*=-0.3; }
+        else if (mn===oT){ p.y -= oT*0.5; p.vy*=-0.3; }
+        else             { p.y += oB*0.5; p.vy*=-0.3; }
       }
-    });
+    }
 
     state.colliding = hit;
     return hit;
   },
 };
+
+
+// ─── 9. CREATURE SYSTEM ─────────────────────────────────────────────────────
+// Two creature types, each with distinct behaviour:
+//
+//  ANGLERFISH  — lurks near the floor, patrols a fixed horizontal range.
+//                Has a bioluminescent lure on a stalk above its head.
+//                Slow, but its hitbox is wide. Facing direction follows motion.
+//
+//  JELLYFISH   — drifts vertically in a sine wave while scrolling with the world.
+//                Passive but fills narrow passages. Glows with a pulsing halo.
+//
+// Both creatures use circle-based collision (radius stored on object).
+// They are generated at world-init time (same seeded RNG pass).
+
+const creatures = [];
+
+(function generateCreatures() {
+  for (let wx = 1200; wx < CFG.WORLD_LENGTH - 600; wx += CFG.CREATURE_SPACING + (rng() - 0.5) * 300) {
+    const kind = rng() > 0.45 ? 'jellyfish' : 'anglerfish';
+
+    if (kind === 'anglerfish') {
+      const floorY = getFloorY(wx);
+      creatures.push({
+        kind,
+        worldX:    wx,
+        baseY:     floorY - 28,       // hovers just above floor
+        y:         floorY - 28,
+        patrolAmp: 60 + rng() * 80,   // how far it roams horizontally (world-space)
+        patrolSpeed: 0.004 + rng() * 0.006,
+        patrolPhase: rng() * Math.PI * 2,
+        facing:    1,                  // 1=right, -1=left
+        lurePhase: rng() * Math.PI * 2,
+        r:         22,                 // collision radius
+        shade:     rng(),
+      });
+    } else {
+      // Jellyfish — mid-water, vertical sinusoidal drift
+      const floorY  = getFloorY(wx);
+      const centreY = 80 + rng() * (floorY - 200);
+      creatures.push({
+        kind,
+        worldX:    wx,
+        baseY:     centreY,
+        y:         centreY,
+        driftAmp:  25 + rng() * 40,
+        driftSpeed: 0.012 + rng() * 0.014,
+        driftPhase: rng() * Math.PI * 2,
+        pulsePhase: rng() * Math.PI * 2,
+        r:         18,
+        hue:       140 + rng() * 100, // teal to blue-purple
+        tentacleCount: 5 + Math.floor(rng() * 4),
+        shade:     rng(),
+      });
+    }
+  }
+})();
+
+const creatureSystem = {
+
+  update() {
+    for (const c of creatures) {
+      if (c.kind === 'anglerfish') {
+        // Patrol: oscillate world-X position around spawn worldX
+        const prevWorldX = c.worldX;
+        c.worldX = c.worldX + Math.sin(state.tick * c.patrolSpeed + c.patrolPhase) * 0.6;
+        // Derive facing from direction of travel
+        const dx = c.worldX - prevWorldX;
+        if (Math.abs(dx) > 0.01) c.facing = dx > 0 ? 1 : -1;
+        // Subtle vertical bob
+        c.y = c.baseY + Math.sin(state.tick * 0.018 + c.patrolPhase) * 5;
+      } else {
+        // Jellyfish: pure vertical sine
+        c.y = c.baseY + Math.sin(state.tick * c.driftSpeed + c.driftPhase) * c.driftAmp;
+      }
+    }
+  },
+
+  draw() {
+    const margin = 160;
+    for (const c of creatures) {
+      const sx = c.worldX - state.worldX;
+      if (sx < -margin || sx > LOGICAL_W + margin) continue;
+      ctx.save();
+      ctx.translate(sx, c.y);
+      if (c.kind === 'anglerfish') this.drawAnglerfish(c);
+      else                          this.drawJellyfish(c);
+      if (CFG.DEBUG) {
+        ctx.strokeStyle = 'rgba(255,200,0,0.8)';
+        ctx.lineWidth   = 1;
+        ctx.beginPath(); ctx.arc(0, 0, c.r, 0, Math.PI*2); ctx.stroke();
+      }
+      ctx.restore();
+    }
+  },
+
+  drawAnglerfish(c) {
+    const f = c.facing;  // 1 or -1
+    ctx.save();
+    ctx.scale(f, 1);     // flip horizontally based on direction
+
+    // ── Lure stalk + light ──
+    const lurePulse = 0.7 + 0.3 * Math.sin(state.tick * 0.06 + c.lurePhase);
+    ctx.save();
+    ctx.strokeStyle = 'rgba(0, 200, 120, 0.5)';
+    ctx.lineWidth   = 1.2;
+    ctx.beginPath();
+    ctx.moveTo(4, -14);
+    ctx.bezierCurveTo(10, -28, 18, -36, 14, -44);
+    ctx.stroke();
+    // Lure bulb glow
+    ctx.save();
+    ctx.globalAlpha = lurePulse;
+    const lureGrad = ctx.createRadialGradient(14, -44, 0, 14, -44, 10);
+    lureGrad.addColorStop(0,   'rgba(80, 255, 160, 1)');
+    lureGrad.addColorStop(0.4, 'rgba(0, 200, 100, 0.5)');
+    lureGrad.addColorStop(1,   'rgba(0, 180, 80, 0)');
+    ctx.fillStyle = lureGrad;
+    ctx.beginPath(); ctx.arc(14, -44, 10, 0, Math.PI*2); ctx.fill();
+    ctx.restore();
+    ctx.restore();
+
+    // ── Body ──
+    const s = c.shade;
+    const bodyGrad = ctx.createRadialGradient(-2, -2, 2, 0, 0, 22);
+    bodyGrad.addColorStop(0,   `rgba(${18+s*20},${30+s*18},${22+s*15},1)`);
+    bodyGrad.addColorStop(0.6, `rgba(${8+s*12}, ${16+s*10},${12+s*8}, 1)`);
+    bodyGrad.addColorStop(1,   `rgba(2, 6, 4, 1)`);
+    ctx.fillStyle = bodyGrad;
+    ctx.beginPath();
+    ctx.ellipse(0, 0, 22, 14, 0, 0, Math.PI*2);
+    ctx.fill();
+    ctx.strokeStyle = `rgba(0,${60+s*80},${40+s*60},0.4)`;
+    ctx.lineWidth = 1; ctx.stroke();
+
+    // ── Huge jaw ──
+    ctx.fillStyle = `rgba(${4+s*12},${10+s*8},${8+s*6},1)`;
+    ctx.beginPath();
+    ctx.moveTo(-8, 6);
+    ctx.lineTo(24, 10);
+    ctx.lineTo(20, 18);
+    ctx.lineTo(-10, 14);
+    ctx.closePath(); ctx.fill();
+    // Teeth
+    ctx.fillStyle = 'rgba(200, 220, 210, 0.6)';
+    for (let t = 0; t < 5; t++) {
+      const tx = -2 + t * 5;
+      ctx.beginPath();
+      ctx.moveTo(tx, 9); ctx.lineTo(tx+2, 15); ctx.lineTo(tx+4, 9);
+      ctx.closePath(); ctx.fill();
+    }
+
+    // ── Eye ──
+    ctx.fillStyle = `rgba(255, 200, 80, 0.9)`;
+    ctx.beginPath(); ctx.arc(12, -5, 4.5, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = 'rgba(0,0,0,0.85)';
+    ctx.beginPath(); ctx.arc(13, -5, 2.5, 0, Math.PI*2); ctx.fill();
+    // Eye gleam
+    ctx.fillStyle = 'rgba(255,255,255,0.8)';
+    ctx.beginPath(); ctx.arc(14, -6, 1, 0, Math.PI*2); ctx.fill();
+
+    // ── Fins ──
+    ctx.fillStyle = `rgba(${8+s*14},${20+s*12},${14+s*10},0.7)`;
+    ctx.beginPath();
+    ctx.moveTo(-10, -4); ctx.lineTo(-22, -14); ctx.lineTo(-16, 2);
+    ctx.closePath(); ctx.fill();
+    ctx.beginPath();
+    ctx.moveTo(4, 10); ctx.lineTo(-2, 22); ctx.lineTo(14, 14);
+    ctx.closePath(); ctx.fill();
+
+    ctx.restore();
+  },
+
+  drawJellyfish(c) {
+    const pulse = 0.6 + 0.4 * Math.sin(state.tick * 0.05 + c.pulsePhase);
+    const hr    = 16 * (0.85 + 0.15 * pulse);  // horizontal radius pulses
+    const vr    = 12 * (1.1  - 0.1  * pulse);  // vertical radius counter-pulses
+    const hue   = c.hue;
+    const s     = c.shade;
+
+    // ── Outer halo glow ──
+    ctx.save();
+    ctx.globalAlpha = 0.18 * pulse;
+    const halo = ctx.createRadialGradient(0, 0, hr * 0.5, 0, 0, hr * 2.2);
+    halo.addColorStop(0,  `hsla(${hue},80%,65%,1)`);
+    halo.addColorStop(1,  `hsla(${hue},80%,65%,0)`);
+    ctx.fillStyle = halo;
+    ctx.beginPath(); ctx.ellipse(0, 0, hr*2.2, vr*2.2, 0, 0, Math.PI*2); ctx.fill();
+    ctx.restore();
+
+    // ── Bell (dome) ──
+    const bellGrad = ctx.createRadialGradient(-hr*0.3, -vr*0.5, 1, 0, 0, hr);
+    bellGrad.addColorStop(0,   `hsla(${hue},70%,${45+s*20}%,0.85)`);
+    bellGrad.addColorStop(0.6, `hsla(${hue},60%,${25+s*15}%,0.75)`);
+    bellGrad.addColorStop(1,   `hsla(${hue},50%,10%,0.6)`);
+    ctx.fillStyle = bellGrad;
+    // Draw dome: full ellipse top half + closed at rim
+    ctx.beginPath();
+    ctx.ellipse(0, 0, hr, vr, 0, Math.PI, 0);  // top half arc
+    ctx.closePath(); ctx.fill();
+    ctx.strokeStyle = `hsla(${hue},70%,70%,0.4)`;
+    ctx.lineWidth = 0.8; ctx.stroke();
+
+    // ── Inner pattern (circular rings inside bell) ──
+    ctx.save();
+    ctx.globalAlpha = 0.3;
+    ctx.strokeStyle = `hsla(${hue},80%,75%,1)`;
+    ctx.lineWidth = 0.6;
+    for (let ring = 1; ring <= 2; ring++) {
+      ctx.beginPath();
+      ctx.ellipse(0, 0, hr * ring/3, vr * ring/3, 0, Math.PI, 0);
+      ctx.stroke();
+    }
+    ctx.restore();
+
+    // ── Tentacles ──
+    for (let t = 0; t < c.tentacleCount; t++) {
+      const tx = -hr * 0.8 + (hr * 1.6 / (c.tentacleCount - 1)) * t;
+      const waveOffset = state.tick * 0.025 + t * 0.8 + c.driftPhase;
+      const sway = Math.sin(waveOffset) * 8;
+      const len  = 20 + Math.sin(waveOffset * 1.3) * 6;
+
+      ctx.beginPath();
+      ctx.moveTo(tx, 0);
+      ctx.quadraticCurveTo(tx + sway * 0.5, len * 0.5, tx + sway, len);
+      ctx.strokeStyle = `hsla(${hue},60%,55%,${0.3 + 0.2 * pulse})`;
+      ctx.lineWidth   = 1.2;
+      ctx.lineCap     = 'round';
+      ctx.stroke();
+    }
+  },
+
+  checkCollisions() {
+    const p   = state.player;
+    const pr  = 14;  // player collision radius (smaller than hitbox — very forgiving)
+    for (const c of creatures) {
+      const sx = c.worldX - state.worldX;
+      const dx = p.x - sx;
+      const dy = p.y - c.y;
+      const dist = Math.hypot(dx, dy);
+      if (dist < pr + c.r) {
+        // Kill velocity and flag collision
+        p.vx *= -0.4; p.vy *= -0.4;
+        state.colliding = true;
+        return true;
+      }
+    }
+    return false;
+  },
+};
+
+
 
 
 
@@ -1054,9 +1261,11 @@ function update() {
   // Update sub-systems
   updateParticles();
   updatePlayer();
+  creatureSystem.update();
 
   // Collision detection (after player position is updated)
   obstacleSystem.checkCollisions();
+  creatureSystem.checkCollisions();
 
   // Update HUD elements
   updateHUD();
@@ -1107,6 +1316,9 @@ function render() {
   // Obstacles sit behind the player but above background
   obstacleSystem.draw();   // draws rocks, debris, coral
   drawFloor();             // procedural floor (drawn on top to cover rock bases)
+
+  // Creatures render above floor but below player
+  creatureSystem.draw();
 
   // Player — position includes idle bob
   const p = state.player;
